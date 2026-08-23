@@ -46,6 +46,19 @@ def parse_time_slot_duration(slot_str: str, default_block_hours: float = 8.0) ->
 
     return round(end - start, 2)
 
+# method that parses time slot with job name
+def parse_time_slot_start_hour(time_slot_str: str, default_block_start: float) -> float:
+    if not time_slot_str or str(time_slot_str).strip().lower() in ("main", "standard", "none", "", "nan"):
+        return default_block_start
+
+    clean_str = str(time_slot_str).strip().replace("–", "-")
+    match = re.search(r"(\d{1,2})(?::(\d{2}))?\s*-\s*(\d{1,2})(?::(\d{2}))?", clean_str)
+    if not match:
+        return default_block_start
+
+    sh, sm, _, _ = match.groups()
+    return float(sh) + (float(sm) / 60.0 if sm else 0.0)
+
 def ingest_from_excel(file_path_or_buffer) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     xls = pd.ExcelFile(file_path_or_buffer)
 
@@ -103,7 +116,7 @@ def ingest_from_excel(file_path_or_buffer) -> Tuple[List[Dict[str, Any]], List[D
             "min_rest_override": float(row["min res override"]) if pd.notna(row.get("min res override")) else None
         }
 
-    # 3. WEEKLY GRID
+# 3. WEEKLY GRID
     df_grid = pd.read_excel(xls, "Weekly_Grid")
     unrolled_shifts = []
 
@@ -126,14 +139,16 @@ def ingest_from_excel(file_path_or_buffer) -> Tuple[List[Dict[str, Any]], List[D
         formatted_slot = format_time_slot_label(time_slot_val)
         full_job_name = f"{base_job_name} {formatted_slot}".strip() if formatted_slot else base_job_name
         shift_duration = parse_time_slot_duration(time_slot_val, default_block_hours=block_def["duration"])
+        slot_start_hour = parse_time_slot_start_hour(time_slot_val, default_block_start=block_def["start_hour"])
 
         for day_name, day_offset in DAY_OFFSETS.items():
             if day_name in row and pd.notna(row[day_name]):
                 workers_needed = int(row[day_name])
                 
                 for slot_idx in range(1, workers_needed + 1):
-                    abs_start = day_offset + block_def["start_hour"]
-                    shift_id = f"S_{job_def['job_id']}_{day_name[:3]}_{block_def['block_id']}_{slot_idx}"
+                    abs_start = day_offset + slot_start_hour
+                    slot_slug = slugify(time_slot_val) if time_slot_val else "MAIN"
+                    shift_id = f"S_{job_def['job_id']}_{slot_slug}_{day_name[:3]}_{block_def['block_id']}_{slot_idx}"
 
                     unrolled_shifts.append({
                         "id": shift_id,

@@ -134,11 +134,11 @@ class Worker(BaseModel):
     def to_dict(self):
         return self.model_dump()
 
-
 class PolicyConfig(BaseModel):
-    min_rest_hours_default: float = 4.0
+    # TODO: Connect this default to employer/tenant settings database model if custom per-client policies are loaded dynamically
+    min_rest_hours_default: float = 8.0          # Base default: 8 hours minimum rest between shifts
+    enforce_strict_rest: bool = True             # Enabled by default
     max_weekly_hours_per_worker: float = 168.0
-    enforce_strict_rest: bool = False
     enforce_max_hours_cap: bool = False
     enforce_consecutive_day_limit: bool = False
     max_consecutive_days: int = 8

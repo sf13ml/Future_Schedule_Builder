@@ -1,0 +1,46 @@
+{
+  "kitchen": {
+    "name": "Kitchen",
+    "required_talents": ["Soldier"],
+    "forbidden_talents": ["Medic"],
+    "despair_factor": 0.0,
+    "min_rest_hours": 0.0
+  },
+  "base_officer": {
+    "name": "Base Officer",
+    "required_talents": ["Officer"],
+    "forbidden_talents": [],
+    "despair_factor": 0.0,
+    "min_rest_hours": 0.0
+  },
+  "medic_in_charge": {
+    "name": "Medic in charge",
+    "required_talents": ["Medic"],
+    "forbidden_talents": []
+  },
+  "patrol_45_commander": {
+    "name": "Patrol 45 Commander",
+    "required_talents": ["Commander"],
+    "forbidden_talents": []
+  },
+  "patrol_45_soldier": {
+    "name": "Patrol 45 Soldier",
+    "required_talents": ["Soldier"],
+    "forbidden_talents": []
+  },
+  "patrol_95_commander": {
+    "name": "Patrol 95 Commander",
+    "required_talents": ["Commander"],
+    "forbidden_talents": []
+  },
+  "patrol_95_soldier": {
+    "name": "Patrol 95 Soldier",
+    "required_talents": ["Soldier"],
+    "forbidden_talents": []
+  },
+  "entrance": {
+    "name": "Entrance",
+    "required_talents": ["Soldier"],
+    "forbidden_talents": []
+  }
+}

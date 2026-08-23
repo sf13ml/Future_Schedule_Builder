@@ -4,8 +4,9 @@ from datetime import datetime
 import statistics
 from typing import Optional, Dict, List
 
-def generate_schedule(workers: list[Worker], shifts: list[Shift], policy: PolicyConfig = PolicyConfig()) -> dict:
+def generate_schedule(workers: List[Worker], shifts: List[Shift], policy: PolicyConfig = PolicyConfig()) -> dict:
     model = cp_model.CpModel()
+    objective_terms = []
 
     # 1. ASSIGNMENT VARIABLES
     assign_vars = {}
@@ -13,29 +14,31 @@ def generate_schedule(workers: list[Worker], shifts: list[Shift], policy: Policy
         for s in shifts:
             assign_vars[(w.uid, s.id)] = model.NewBoolVar(f"w_{w.uid}_s_{s.id}")
 
-    # 2. SHIFT CAPACITY & SKILL CONSTRAINT
+    # 2. SHIFT CAPACITY & SKILL CONSTRAINT WITH SLACK (SOFT DEMAND)
+    unstaffed_vars = {}
+    
+    # Large penalty weight to ensure filling shifts is prioritized over worker preference/despair optimization
+    UNSTAFFED_SLOT_PENALTY = 100000
+
     for s in shifts:
+        req_workers = getattr(s.job, 'required_number_workers', 1)
         shift_workers = []
+
         for w in workers:
             if w.is_eligible_for_job(s.job):
                 shift_workers.append(assign_vars[(w.uid, s.id)])
             else:
                 model.Add(assign_vars[(w.uid, s.id)] == 0)
-        
-        if shift_workers:
-            model.Add(sum(shift_workers) == s.job.required_number_workers)
-        else:
-            return {
-                "status": "infeasible",
-                "message": f"Infeasibility Forensic: Shift '{s.id}' requires talents {s.job.required_talents}, but zero workers in the roster qualify.",
-                "diagnostics": [{
-                    "severity": "CRITICAL",
-                    "code": "TALENT_MISSING",
-                    "entity": getattr(s.job, 'name', str(s.job)),
-                    "reason": f"Shift '{s.id}' requires talents {getattr(s.job, 'required_talents', [])}, but zero workers in the roster qualify.",
-                    "remediation": "Add qualified personnel to the workforce roster or adjust shift skill requirements."
-                }]
-            }
+
+        # Create slack variable representing missing workers for this shift
+        unstaffed_slack = model.NewIntVar(0, req_workers, f"unstaffed_shift_{s.id}")
+        unstaffed_vars[s.id] = unstaffed_slack
+
+        # Soft Constraint Equation: Assigned Workers + Missing Workers = Required Workers
+        model.Add(sum(shift_workers) + unstaffed_slack == req_workers)
+
+        # Add heavy penalty to objective function for any unstaffed slot
+        objective_terms.append(unstaffed_slack * UNSTAFFED_SLOT_PENALTY)
 
     # 3. LEAVE & UNAVAILABILITY HARD CONSTRAINTS
     for w in workers:
@@ -45,32 +48,39 @@ def generate_schedule(workers: list[Worker], shifts: list[Shift], policy: Policy
                 continue
             
             s_end = s.abs_start_hour + s.hours_duration
-            is_blocked = False
-            for (b_start, b_end) in w.blocked_intervals:
-                if s.abs_start_hour < b_end and b_start < s_end:
-                    is_blocked = True
-                    break
+            is_blocked = any(
+                s.abs_start_hour < b_end and b_start < s_end
+                for (b_start, b_end) in getattr(w, 'blocked_intervals', [])
+            )
             if is_blocked:
                 model.Add(assign_vars[(w.uid, s.id)] == 0)
 
-    # 3.5 NO CONCURRENT OVERLAPS 
+    # 4. OVERLAPS & REST CONSTRAINTS (Unified Sweep)
+    sorted_shifts = sorted(shifts, key=lambda s: s.abs_start_hour)
+    enforce_rest = getattr(policy, 'enforce_strict_rest', False)
+    
     for w in workers:
-        for i, s1 in enumerate(shifts):
-            for s2 in shifts[i+1:]:
-                if s1.id == s2.id:
-                    continue
+        for i, s1 in enumerate(sorted_shifts):
+            s1_end = s1.abs_start_hour + s1.hours_duration
             
-                s1_end = s1.abs_start_hour + s1.hours_duration
-                s2_end = s2.abs_start_hour + s2.hours_duration
+            required_rest = 0.0
+            if enforce_rest:
+                required_rest = getattr(s1.job, 'min_rest_override', None)
+                if required_rest is None:
+                    required_rest = getattr(s1.job, 'min_rest_hours', policy.min_rest_hours_default)
             
-                # Check for temporal overlap
-                if s1.abs_start_hour < s2_end and s2.abs_start_hour < s1_end:
-                    model.AddAtMostOne([
-                        assign_vars[(w.uid, s1.id)], 
-                        assign_vars[(w.uid, s2.id)]
+            min_next_allowed_start = s1_end + required_rest
+
+            for s2 in sorted_shifts[i+1:]:
+                if s2.abs_start_hour >= min_next_allowed_start:
+                    break
+                
+                model.AddAtMostOne([
+                    assign_vars[(w.uid, s1.id)], 
+                    assign_vars[(w.uid, s2.id)]
                 ])
 
-    # 3.6 MAX HOURS CAPACITY (Conditional on Policy Flag)
+    # 3.6 MAX HOURS CAPACITY
     if getattr(policy, 'enforce_max_hours_cap', False):
         for w in workers:
             max_cap = int(getattr(w, 'max_hours', None) or policy.max_weekly_hours_per_worker)
@@ -78,79 +88,73 @@ def generate_schedule(workers: list[Worker], shifts: list[Shift], policy: Policy
                 sum(assign_vars[(w.uid, s.id)] * int(s.hours_duration) for s in shifts) <= max_cap
             )
 
-    # 4. CONFIGURABLE REST CONSTRAINTS (Conditional on Policy Flag)
-    if getattr(policy, 'enforce_strict_rest', False):
-        for w in workers:
-            for s1 in shifts:
-                s1_end = s1.abs_start_hour + s1.hours_duration
-                required_rest = getattr(s1.job, 'min_rest_override', None)
-                if required_rest is None:
-                    required_rest = getattr(s1.job, 'min_rest_hours', policy.min_rest_hours_default)
-
-                for s2 in shifts:
-                    if s1.id == s2.id:
-                        continue
-                    if s1.abs_start_hour <= s2.abs_start_hour < (s1_end + required_rest):
-                        model.AddForbiddenAssignments([assign_vars[(w.uid, s1.id)], assign_vars[(w.uid, s2.id)]], [(1, 1)])
-
-    # 5. OBJECTIVE FUNCTION: Convex Workload Tiering & Shift Despair Minimization
-        objective_terms = []
-
-        for w in workers:
-            # 5.1 Create intermediate total assigned hours for worker in current schedule
-            worker_assigned_hours = model.NewIntVar(0, 168, f"total_hours_{w.uid}")
-            model.Add(
-                worker_assigned_hours == sum(
-                    assign_vars[(w.uid, s.id)] * int(s.hours_duration) for s in shifts
-                )
+    # 5. WORKLOAD & PREFERENCE OBJECTIVE TERMS
+    for w in workers:
+        worker_assigned_hours = model.NewIntVar(0, 168, f"total_hours_{w.uid}")
+        model.Add(
+            worker_assigned_hours == sum(
+                assign_vars[(w.uid, s.id)] * int(s.hours_duration) for s in shifts
             )
+        )
 
-            # 5.2 Convex Tier Variables for current schedule
-            # Tier 1: 0 - 24 hours
-            # Tier 2: 24 - 40 hours
-            # Tier 3: 40 - 56 hours
-            # Tier 4: > 56 hours
-            t1 = model.NewIntVar(0, 24, f"t1_{w.uid}")
-            t2 = model.NewIntVar(0, 16, f"t2_{w.uid}")
-            t3 = model.NewIntVar(0, 16, f"t3_{w.uid}")
-            t4 = model.NewIntVar(0, 112, f"t4_{w.uid}")
+        t1 = model.NewIntVar(0, 24, f"t1_{w.uid}")
+        t2 = model.NewIntVar(0, 16, f"t2_{w.uid}")
+        t3 = model.NewIntVar(0, 16, f"t3_{w.uid}")
+        t4 = model.NewIntVar(0, 112, f"t4_{w.uid}")
 
-            model.Add(worker_assigned_hours == t1 + t2 + t3 + t4)
+        model.Add(worker_assigned_hours == t1 + t2 + t3 + t4)
+        tier_cost = (t1 * 10) + (t2 * 18) + (t3 * 35) + (t4 * 70)
+        objective_terms.append(tier_cost)
 
-            # Add convex bucket costs (scaled to integers for CP-SAT)
-            # Tier 1 = 1.0x (10), Tier 2 = 1.8x (18), Tier 3 = 3.5x (35), Tier 4 = 7.0x (70)
-            tier_cost = (t1 * 10) + (t2 * 18) + (t3 * 35) + (t4 * 70)
-            objective_terms.append(tier_cost)
+        for s in shifts:
+            hour_of_day = s.abs_start_hour % 24
+            is_night = (hour_of_day >= 22.0) or (hour_of_day < 6.0) or ("night" in s.time_slot.lower())
+            
+            time_multiplier = policy.night_shift_penalty_multiplier if is_night else 1.0
+            if is_night and getattr(w, 'prefers_night', False):
+                time_multiplier = policy.night_owl_discount
 
-            # 5.3 Shift Preference & Job Specific Modifiers
-            for s in shifts:
-                hour_of_day = s.abs_start_hour % 24
-                is_night = (hour_of_day >= 22.0) or (hour_of_day < 6.0) or ("night" in s.time_slot.lower())
-                
-                time_multiplier = policy.night_shift_penalty_multiplier if is_night else 1.0
-                if is_night and w.prefers_night:
-                    time_multiplier = policy.night_owl_discount
+            job_despair_factor = getattr(s.job, 'despair_factor', 1.0)
+            hist_hours = getattr(w, 'total_hours', 0) or 0
+            historical_factor = 1.0 + (min(hist_hours / 40.0, 1.5) * policy.historical_load_scaling_weight) if hist_hours else 1.0
 
-                job_despair_factor = getattr(s.job, 'despair_factor', 1.0)
-                
-                # Historical context penalty from past weeks
-                historical_factor = 1.0 + (min(w.total_hours / 40.0, 1.5) * policy.historical_load_scaling_weight) if w.total_hours else 1.0
+            shift_base_cost = int(round(s.hours_duration * time_multiplier * job_despair_factor * historical_factor * 100))
+            objective_terms.append(assign_vars[(w.uid, s.id)] * shift_base_cost)
 
-                shift_base_cost = int(s.hours_duration * time_multiplier * job_despair_factor * historical_factor * 5)
-                objective_terms.append(assign_vars[(w.uid, s.id)] * shift_base_cost)
-
-                model.Minimize(sum(objective_terms))
+    model.Minimize(sum(objective_terms))
 
     # 6. SOLVE MODEL
     solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 5.0
+    solver.parameters.search_branching = cp_model.PORTFOLIO_SEARCH
     status = solver.Solve(model)
 
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         assignments = []
-        worker_hours_map = {w.uid: w.total_hours for w in workers}
-        worker_despair_map = {w.uid: getattr(w, 'despair', 0.0) for w in workers}
+        unstaffed_report = []
+        diagnostics = []
 
+        worker_hours_map = {w.uid: getattr(w, 'total_hours', 0) for w in workers}
+        worker_despair_map = {w.uid: getattr(w, 'despair', 0.0) for w in workers}
         job_stats = {}
+
+        # Collect unstaffed slot diagnostics
+        for s in shifts:
+            missing_count = solver.Value(unstaffed_vars[s.id])
+            if missing_count > 0:
+                unstaffed_report.append({
+                    "shift_id": s.id,
+                    "job_name": getattr(s.job, 'name', str(s.job)),
+                    "missing_slots": missing_count,
+                    "required_slots": getattr(s.job, 'required_number_workers', 1)
+                })
+                diagnostics.append({
+                    "severity": "WARNING",
+                    "code": "UNDERSTAFFED_SHIFT",
+                    "entity": s.id,
+                    "reason": f"Shift '{s.id}' is short by {missing_count} worker(s).",
+                    "remediation": "Adjust worker availability or recruit extra staff."
+                })
 
         for s in shifts:
             job_name = s.job.name if hasattr(s.job, "name") else str(s.job)
@@ -170,7 +174,7 @@ def generate_schedule(workers: list[Worker], shifts: list[Shift], policy: Policy
                     hour_of_day = s.abs_start_hour % 24
                     is_night = (hour_of_day >= 22.0) or (hour_of_day < 6.0) or ("night" in s.time_slot.lower())
                     multiplier = policy.night_shift_penalty_multiplier if is_night else 1.0
-                    if is_night and w.prefers_night:
+                    if is_night and getattr(w, 'prefers_night', False):
                         multiplier = policy.night_owl_discount
                     
                     job_despair_factor = getattr(s.job, 'despair_factor', 1.0)
@@ -195,6 +199,15 @@ def generate_schedule(workers: list[Worker], shifts: list[Shift], policy: Policy
                         "worker_uid": w.uid,
                         "worker_name": w.name
                     })
+
+        if not diagnostics:
+            diagnostics.append({
+                "severity": "INFO",
+                "code": "OPTIMAL_SCHEDULE",
+                "entity": "Global Roster",
+                "reason": "All demand slots satisfied under soft load balancing.",
+                "remediation": "None required."
+            })
 
         manpower_utilization = []
         total_pool_capacity_hours = 0.0
@@ -226,7 +239,7 @@ def generate_schedule(workers: list[Worker], shifts: list[Shift], policy: Policy
         summary_cards = [
             {"label": "Overall Pool Capacity Utilization (TCU)", "value": f"{overall_tcu_pct:.1f}%"},
             {"label": "Overall Avg. Cumulative Despair (CDR)", "value": f"{avg_pool_cdr:.2f}"},
-            {"label": "Total Pool Capacity", "value": f"{total_pool_capacity_hours:.0f} hrs"},
+            {"label": "Total Unstaffed Slots", "value": sum(r["missing_slots"] for r in unstaffed_report)},
             {"label": "Total Hours Assigned", "value": f"{total_assigned_hours:.0f} hrs"},
             {"label": "Total Shifts Scheduled", "value": len(assignments)}
         ]
@@ -255,11 +268,12 @@ def generate_schedule(workers: list[Worker], shifts: list[Shift], policy: Policy
             worker_summaries.append(w_dict)
 
         return {
-            "status": "optimal" if status == cp_model.OPTIMAL else "feasible",
+            "status": "optimal" if (status == cp_model.OPTIMAL and not unstaffed_report) else "feasible",
             "meta": {
                 "generated_at": datetime.utcnow().isoformat(),
                 "status": "success",
                 "total_assignments": len(assignments),
+                "unstaffed_slots": unstaffed_report,
                 "policy_applied": policy.to_dict() if hasattr(policy, "to_dict") else str(policy)
             },
             "assignments": assignments,
@@ -269,26 +283,20 @@ def generate_schedule(workers: list[Worker], shifts: list[Shift], policy: Policy
                 "job_coverage": job_coverage,
                 "manpower_utilization": manpower_utilization
             },
-            "diagnostics": [{
-                "severity": "INFO",
-                "code": "OPTIMAL_SCHEDULE",
-                "entity": "Global Roster",
-                "reason": "All demand slots satisfied under soft load balancing.",
-                "remediation": "None required."
-            }]
+            "diagnostics": diagnostics
         }
-    else:
-        return {
-            "status": "infeasible",
-            "detail": "Optimization Infeasible: Hard structural constraint collision.",
-            "diagnostics": [{
-                "severity": "CRITICAL",
-                "code": "SOLVER_INFEASIBLE",
-                "entity": "Global Matrix",
-                "reason": "Optimization Infeasible: Shift demand overlaps exceed available personnel windows, or strict rest constraints caused a deadlock.",
-                "remediation": "Relax strict rest constraints or increase worker pool capacity."
-            }]
-        }
+
+    return {
+        "status": "infeasible",
+        "detail": "Optimization Infeasible: Hard structural constraint collision.",
+        "diagnostics": [{
+            "severity": "CRITICAL",
+            "code": "SOLVER_INFEASIBLE",
+            "entity": "Global Matrix",
+            "reason": "Hard constraints (unavailability/rest blocks) prevented finding any valid schedule.",
+            "remediation": "Relax strict rest constraints or check worker availability windows."
+        }]
+    }
 
 def _add_inter_shift_rest_constraints(
     model: cp_model.CpModel,

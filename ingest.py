@@ -7,20 +7,28 @@ DAY_OFFSETS = {
     "Wednesday": 72.0, "Thursday": 96.0, "Friday": 120.0, "Saturday": 144.0
 }
 
+# Pre-compiled Regex patterns for execution speed
+TIME_SLOT_PATTERN = re.compile(r"(\d{1,2})(?::(\d{2}))?\s*-\s*(\d{1,2})(?::(\d{2}))?")
+SLUG_CLEAN_1 = re.compile(r'[^a-zA-Z0-9]')
+SLUG_CLEAN_2 = re.compile(r'_+')
+
+
 def slugify(text: str) -> str:
-    clean = re.sub(r'[^a-zA-Z0-9]', '_', str(text).strip())
-    return re.sub(r'_+', '_', clean).strip('_').upper()
+    clean = SLUG_CLEAN_1.sub('_', str(text).strip())
+    return SLUG_CLEAN_2.sub('_', clean).strip('_').upper()
+
 
 def parse_time_to_hours(time_str: str) -> float:
     parts = str(time_str).strip().split(":")
     return float(parts[0]) + (float(parts[1]) / 60.0 if len(parts) > 1 else 0.0)
+
 
 def format_time_slot_label(slot_str: str) -> str:
     """Dynamically converts '06-10' or '06:00-10:00' to standardized 'HH:MM-HH:MM' format."""
     if not slot_str or str(slot_str).strip().lower() in ("main", "standard", "none", "", "nan"):
         return ""
     clean_str = str(slot_str).strip().replace("–", "-")
-    match = re.search(r"(\d{1,2})(?::(\d{2}))?\s*-\s*(\d{1,2})(?::(\d{2}))?", clean_str)
+    match = TIME_SLOT_PATTERN.search(clean_str)
     if not match:
         return clean_str
     sh, sm, eh, em = match.groups()
@@ -28,12 +36,13 @@ def format_time_slot_label(slot_str: str) -> str:
     end_fmt = f"{int(eh):02d}:{em if em else '00'}"
     return f"{start_fmt}-{end_fmt}"
 
+
 def parse_time_slot_duration(slot_str: str, default_block_hours: float = 8.0) -> float:
     if not slot_str or str(slot_str).strip().lower() in ("main", "standard", "none", "", "nan"):
         return default_block_hours
 
     clean_str = str(slot_str).strip().replace("–", "-")
-    match = re.search(r"(\d{1,2})(?::(\d{2}))?\s*-\s*(\d{1,2})(?::(\d{2}))?", clean_str)
+    match = TIME_SLOT_PATTERN.search(clean_str)
     if not match:
         return default_block_hours
 
@@ -46,18 +55,19 @@ def parse_time_slot_duration(slot_str: str, default_block_hours: float = 8.0) ->
 
     return round(end - start, 2)
 
-# method that parses time slot with job name
+
 def parse_time_slot_start_hour(time_slot_str: str, default_block_start: float) -> float:
     if not time_slot_str or str(time_slot_str).strip().lower() in ("main", "standard", "none", "", "nan"):
         return default_block_start
 
     clean_str = str(time_slot_str).strip().replace("–", "-")
-    match = re.search(r"(\d{1,2})(?::(\d{2}))?\s*-\s*(\d{1,2})(?::(\d{2}))?", clean_str)
+    match = TIME_SLOT_PATTERN.search(clean_str)
     if not match:
         return default_block_start
 
     sh, sm, _, _ = match.groups()
     return float(sh) + (float(sm) / 60.0 if sm else 0.0)
+
 
 def ingest_from_excel(file_path_or_buffer) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     xls = pd.ExcelFile(file_path_or_buffer)
@@ -67,7 +77,7 @@ def ingest_from_excel(file_path_or_buffer) -> Tuple[List[Dict[str, Any]], List[D
     blocks_map = {}
     block_id_counts = {}
 
-    for _, row in df_blocks.iterrows():
+    for row in df_blocks.to_dict("records"):
         label = str(row["block label"]).strip()
         base_slug = slugify(label)
 
@@ -94,7 +104,7 @@ def ingest_from_excel(file_path_or_buffer) -> Tuple[List[Dict[str, Any]], List[D
     jobs_map = {}
     job_id_counts = {}
 
-    for _, row in df_jobs.iterrows():
+    for row in df_jobs.to_dict("records"):
         display_name = str(row["job name"]).strip()
         base_slug = slugify(display_name)
         
@@ -116,14 +126,30 @@ def ingest_from_excel(file_path_or_buffer) -> Tuple[List[Dict[str, Any]], List[D
             "min_rest_override": float(row["min res override"]) if pd.notna(row.get("min res override")) else None
         }
 
-# 3. WEEKLY GRID
+    # 3. WEEKLY GRID (Vectorized Melt + Filtering)
     df_grid = pd.read_excel(xls, "Weekly_Grid")
+    
+    # Unpivot day columns into rows to eliminate inner day loops
+    day_cols = [d for d in DAY_OFFSETS.keys() if d in df_grid.columns]
+    df_melted = df_grid.melt(
+        id_vars=[c for c in df_grid.columns if c not in day_cols],
+        value_vars=day_cols,
+        var_name="day_name",
+        value_name="workers_needed"
+    )
+
+    # Discard non-numeric, null, or zero demand immediately
+    df_melted = df_melted[pd.to_numeric(df_melted["workers_needed"], errors="coerce").fillna(0) > 0].copy()
+    df_melted["workers_needed"] = df_melted["workers_needed"].astype(int)
+
     unrolled_shifts = []
 
-    for _, row in df_grid.iterrows():
+    for row in df_melted.to_dict("records"):
         base_job_name = str(row["job name"]).strip()
         time_slot_val = str(row.get("Time slot", "")).strip() if pd.notna(row.get("Time slot")) else "Main"
         block_label_val = str(row["block label"]).strip()
+        day_name = row["day_name"]
+        workers_needed = row["workers_needed"]
 
         block_key = block_label_val.lower()
         job_key = base_job_name.lower()
@@ -141,32 +167,32 @@ def ingest_from_excel(file_path_or_buffer) -> Tuple[List[Dict[str, Any]], List[D
         shift_duration = parse_time_slot_duration(time_slot_val, default_block_hours=block_def["duration"])
         slot_start_hour = parse_time_slot_start_hour(time_slot_val, default_block_start=block_def["start_hour"])
 
-        for day_name, day_offset in DAY_OFFSETS.items():
-            if day_name in row and pd.notna(row[day_name]):
-                workers_needed = int(row[day_name])
-                
-                for slot_idx in range(1, workers_needed + 1):
-                    abs_start = day_offset + slot_start_hour
-                    slot_slug = slugify(time_slot_val) if time_slot_val else "MAIN"
-                    shift_id = f"S_{job_def['job_id']}_{slot_slug}_{day_name[:3]}_{block_def['block_id']}_{slot_idx}"
+        day_offset = DAY_OFFSETS[day_name]
+        abs_start = day_offset + slot_start_hour
+        slot_slug = slugify(time_slot_val) if time_slot_val else "MAIN"
+        day_short = day_name[:3]
 
-                    unrolled_shifts.append({
-                        "id": shift_id,
-                        "slot_label": f"{full_job_name}_slot_{slot_idx}",
-                        "day": day_name,
-                        "job": job_def,
-                        "job_group": base_job_name,
-                        "job_name": full_job_name,
-                        "time_block": block_label_val.lower(),
-                        "time_slot": time_slot_val,
-                        "hours_duration": shift_duration,
-                        "abs_start_hour": abs_start
-                    })
+        for slot_idx in range(1, workers_needed + 1):
+            shift_id = f"S_{job_def['job_id']}_{slot_slug}_{day_short}_{block_def['block_id']}_{slot_idx}"
+
+            unrolled_shifts.append({
+                "id": shift_id,
+                "slot_label": f"{full_job_name}_slot_{slot_idx}",
+                "day": day_name,
+                "job": job_def,
+                "job_group": base_job_name,
+                "job_name": full_job_name,
+                "time_block": block_key,
+                "time_slot": time_slot_val,
+                "hours_duration": shift_duration,
+                "abs_start_hour": abs_start
+            })
 
     # 4. EMPLOYEES
     df_emp = pd.read_excel(xls, "Employees")
     workers = []
-    for _, row in df_emp.iterrows():
+    
+    for row in df_emp.to_dict("records"):
         raw_quals = str(row["qualifications"]) if pd.notna(row.get("qualifications")) else ""
         workers.append({
             "uid": str(row["uid"]).strip(),

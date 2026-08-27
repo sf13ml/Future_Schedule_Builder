@@ -1,0 +1,28 @@
+ini_TOML.env
+.env
+notes.odt
+notes.odt
+tests/Full Shift Test/test file 1.xlsx
+tests/Full Shift Test/test file 2.xlsx
+
+__pycache__/excel_exporter.cpython-314.pyc
+__pycache__/ingest.cpython-314.pyc
+__pycache__/main.cpython-314.pyc
+__pycache__/models.cpython-314.pyc
+__pycache__/solver.cpython-314.pyc
+# Byte-compiled / Python cache files
+__pycache__/
+*.pyc
+*.py[cod]
+
+# Lock & document files
+.~lock.*.odt#
+*.odt
+
+# Environment / Config
+.env
+*.ini_TOML.env
+
+# Test & sample Excel files
+*.xlsx
+*.xls

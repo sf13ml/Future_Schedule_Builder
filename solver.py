@@ -2,7 +2,7 @@ from ortools.sat.python import cp_model
 from models import Worker, Shift, PolicyConfig
 from datetime import datetime
 import statistics
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple, Any
 
 def generate_schedule(workers: List[Worker], shifts: List[Shift], policy: PolicyConfig = PolicyConfig()) -> dict:
     model = cp_model.CpModel()
@@ -325,3 +325,111 @@ def _add_inter_shift_rest_constraints(
                 # Block s2 if it starts after s1 starts, but before (s1_end + min_rest)
                 if s1.abs_start_hour <= s2.abs_start_hour < (s1_end + min_rest):
                     model.Add(assign_vars[(w.uid, s1.id)] + assign_vars[(w.uid, s2.id)] <= 1)
+
+def build_and_solve_schedule(
+    workers: List[Worker],
+    shifts: List[Shift],
+    policy: PolicyConfig
+) -> Dict[str, Any]:
+    model = cp_model.CpModel()
+    
+    # 1. Filter Decision Variables (Skip Fixed/Historical Shifts)
+    # Decision variables are only created for shifts that need assignment (is_fixed == False)
+    assign_vars: Dict[Tuple[str, str], cp_model.BoolVar] = {}
+    
+    planning_shifts = [s for s in shifts if not s.is_fixed]
+    
+    for w in workers:
+        for s in planning_shifts:
+            if w.is_eligible_for_job(s.job):
+                assign_vars[(w.uid, s.id)] = model.NewBoolVar(f"assign_{w.uid}_{s.id}")
+            else:
+                # Ineligible workers cannot be assigned
+                pass
+
+
+    # 2. Hard Rest Constraints across $T_{cutoff}$ Boundary
+    min_rest = policy.min_rest_hours_default
+
+    for w in workers:
+        # Check if worker worked right up to or near T_cutoff
+        if w.last_assigned_end_hour > -8.0:
+            for s in planning_shifts:
+                if (w.uid, s.id) in assign_vars:
+                    job_rest = s.job.min_rest_override if s.job.min_rest_override is not None else min_rest
+                    
+                    # If shift starts before (last_end_hour + rest_period), forbid assignment
+                    if s.abs_start_hour < w.last_assigned_end_hour + job_rest:
+                        model.Add(assign_vars[(w.uid, s.id)] == 0)
+
+    # 3. Workload Balance & Convex Tiering Offset
+    # Define Tiers (in integer hours for CP-SAT integer precision)
+    # Tier 1: 0 - 40 hours (Standard rate)
+    # Tier 2: 40 - 50 hours (Overtime penalty)
+    # Tier 3: 50+ hours (Severe overtime penalty)
+    
+    SCALE = 10 
+    
+    total_cost_terms = []
+
+    for w in workers:
+        # Calculate planned duration integer variable
+        planned_hours_expr = []
+        for s in planning_shifts:
+            if (w.uid, s.id) in assign_vars:
+                planned_hours_expr.append(assign_vars[(w.uid, s.id)] * int(s.hours_duration * SCALE))
+
+        # Total work variable = scaled_historical + scaled_planned
+        hist_scaled = int(w.historical_hours * SCALE)
+        
+        total_hours_var = model.NewIntVar(
+            hist_scaled, 
+            int(policy.max_weekly_hours_per_worker * SCALE), 
+            f"total_hours_{w.uid}"
+        )
+        model.Add(total_hours_var == hist_scaled + sum(planned_hours_expr))
+
+        # --- Tier 2 Overtime Penalty ( > 40 hours ) ---
+        # Penalize only hours beyond 40.0 cumulative total
+        tier2_threshold = 40 * SCALE
+        tier2_excess = model.NewIntVar(0, int(policy.max_weekly_hours_per_worker * SCALE), f"t2_excess_{w.uid}")
+        
+        # tier2_excess >= total_hours_var - tier2_threshold
+        model.Add(tier2_excess >= total_hours_var - tier2_threshold)
+        model.Add(tier2_excess >= 0)
+        
+        # Cost penalty applied to tier 2 hours
+        total_cost_terms.append(tier2_excess * 15)
+
+        # --- Tier 3 Heavy Overtime Penalty ( > 50 hours ) ---
+        tier3_threshold = 50 * SCALE
+        tier3_excess = model.NewIntVar(0, int(policy.max_weekly_hours_per_worker * SCALE), f"t3_excess_{w.uid}")
+        
+        model.Add(tier3_excess >= total_hours_var - tier3_threshold)
+        model.Add(tier3_excess >= 0)
+        
+        # Progressive penalty multiplier for severe load
+        total_cost_terms.append(tier3_excess * 50)
+
+    # 4. Objective Function & Solving
+    model.Minimize(sum(total_cost_terms))
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 30.0
+    status = solver.Solve(model)
+
+    # --- Post-Processing: Update Worker Objects ---
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        for w in workers:
+            assigned_planned_hours = 0.0
+            for s in planning_shifts:
+                if (w.uid, s.id) in assign_vars and solver.Value(assign_vars[(w.uid, s.id)]) == 1:
+                    assigned_planned_hours += s.hours_duration
+                    s.assigned_worker_uids.append(w.uid)
+            
+            # Update Pydantic model state
+            w.planned_hours = assigned_planned_hours
+            
+        return {"status": "SUCCESS"}
+    
+    return {"status": "INFEASIBLE"}

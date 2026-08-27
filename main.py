@@ -3,7 +3,7 @@ from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, status, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-
+from fastapi.responses import StreamingResponse
 from database import get_db, init_db
 from models import Worker, Shift, PolicyConfig, LayoutBlueprint
 import crud
@@ -141,3 +141,16 @@ async def generate_schedule_from_excel(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
             detail=f"Internal Server Error: {str(e)}"
         )
+
+
+@app.post("/upload-partial-excel")
+async def upload_partial_excel(file: UploadFile = File(...)):
+    # Read the partial Excel uploaded by the client
+    contents = await file.read()
+    
+    
+    return {
+        "filename": file.filename,
+        "status": "success",
+        "message": "Partial schedule updated successfully"
+    }

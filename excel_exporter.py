@@ -7,6 +7,52 @@ from models import LayoutBlueprint
 from typing import Any, List, Dict
 from pydantic import BaseModel
 
+# --- HEBREW DETECTION LAYER ---
+
+def contains_hebrew(text: str) -> bool:
+    """Returns True if the string contains at least one Hebrew character."""
+    if not isinstance(text, str):
+        return False
+    return bool(re.search(r"[\u0590-\u05FF]", text))
+
+def detect_dataset_direction(schedule_data: Any) -> bool:
+    """Scans raw schedule data to detect if any string contains Hebrew characters."""
+    if isinstance(schedule_data, dict):
+        raw_assignments = schedule_data.get("assignments") or schedule_data.get("schedule") or []
+    elif isinstance(schedule_data, list):
+        raw_assignments = schedule_data
+    else:
+        raw_assignments = []
+
+    for item in raw_assignments:
+        if isinstance(item, dict):
+            for val in item.values():
+                if contains_hebrew(str(val)):
+                    return True
+        elif contains_hebrew(str(item)):
+            return True
+    return False
+
+# --- DYNAMIC TIME SLOT FORMATTER ---
+
+def standardize_shift_hours(raw_slot: str) -> str:
+    """Formats raw slot strings (e.g., '06-10', '14-18') into 'HH:MM-HH:MM' without hardcoding defaults."""
+    if not raw_slot or str(raw_slot).strip().lower() in ("none", "", "nan", "unassigned", "main", "standard"):
+        return ""
+    
+    clean_str = str(raw_slot).strip().replace("–", "-")
+    parts = clean_str.split("-")
+    
+    if len(parts) == 2:
+        start_p, end_p = parts[0].strip(), parts[1].strip()
+        if ":" not in start_p and start_p.isdigit():
+            start_p = f"{int(start_p):02d}:00"
+        if ":" not in end_p and end_p.isdigit():
+            end_p = f"{int(end_p):02d}:00"
+        return f"{start_p}-{end_p}"
+        
+    return clean_str
+
 # --- DATA CONTRACT / NORMALIZATION LAYER ---
 
 class CanonicalAssignment(BaseModel):
@@ -33,8 +79,8 @@ class CanonicalAssignment(BaseModel):
         )
 
         # 2. Resolve Time Block & Time Slot separately
-        time_slot_raw = data.get("time_slot") or data.get("shift_hours") or "Unassigned"
-        time_block_raw = data.get("time_block") or "Unassigned"
+        time_slot_raw = data.get("time_slot") or data.get("shift_hours") or ""
+        time_block_raw = data.get("time_block") or data.get("block") or "General"
 
         # 3. Resolve Day Name
         day_raw = data.get("day_name") or data.get("day") or ""
@@ -54,6 +100,8 @@ class CanonicalAssignment(BaseModel):
             or (str(data.get("worker")) if data.get("worker") and not isinstance(data.get("worker"), dict) else "")
         )
 
+        clean_worker_name = str(worker_name_raw).strip() if worker_name_raw and str(worker_name_raw).lower() != "none" else ""
+
         # 5. Resolve Shift ID
         shift_id_raw = data.get("id") or data.get("shift_id") or ""
 
@@ -64,21 +112,26 @@ class CanonicalAssignment(BaseModel):
             time_slot=str(time_slot_raw).strip(),
             job_name=str(job_raw).strip(),
             worker_uid=str(worker_uid_raw).strip(),
-            worker_name=str(worker_name_raw).strip() if str(worker_name_raw) != "None" else ""
+            worker_name=clean_worker_name
         )
 
 
 # --- MAIN EXPORT FUNCTION ---
 
-def generate_excel_schedule(schedule_data: Any, blueprint: LayoutBlueprint = LayoutBlueprint()) -> io.BytesIO:
+def generate_excel_schedule(schedule_data: Any, blueprint: LayoutBlueprint = LayoutBlueprint(), is_rtl: bool = None) -> io.BytesIO:
+    if is_rtl is None:
+        is_rtl = detect_dataset_direction(schedule_data)
+
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "Schedule"
+    ws.title = "לוח משמרות" if is_rtl else "Schedule"
     
-    if hasattr(ws, 'sheet_view'):
+    ws.views.sheetView[0].rightToLeft = is_rtl
+
+    try:
         ws.sheet_view.showGridLines = blueprint.show_gridlines
-    elif len(ws.views.sheetView) > 0:
-        ws.views.sheetView[0].showGridLines = blueprint.show_gridlines
+    except AttributeError:
+        pass
 
     # Unpack Payload
     if isinstance(schedule_data, dict):
@@ -92,20 +145,19 @@ def generate_excel_schedule(schedule_data: Any, blueprint: LayoutBlueprint = Lay
         diagnostics = []
         status = "optimal"
 
-    # Normalize incoming assignments via Canonical Contract
     assignments: List[CanonicalAssignment] = [
         CanonicalAssignment.from_dict(a) for a in raw_assignments if isinstance(a, dict)
     ]
 
     # Tab 1: Schedule Matrix / Tabular
-    if blueprint.layout_type == "tabular":
-        _render_tabular_layout(ws, assignments, blueprint)
+    if getattr(blueprint, "layout_type", "matrix") == "tabular":
+        _render_tabular_layout(ws, assignments, blueprint, is_rtl)
     else:
-        _render_matrix_layout(ws, assignments, blueprint)
+        _render_matrix_layout(ws, assignments, blueprint, is_rtl)
 
     # Tab 2: Analytics & Metrics
-    if metrics:
-        _render_analytics_sheet(wb, metrics)
+    if metrics or any(a.worker_name for a in assignments):
+        _render_analytics_sheet(wb, metrics, is_rtl)
 
     # Tab 3: System Diagnostics & Debug
     if not diagnostics and status in ("infeasible", "infeasable"):
@@ -125,74 +177,17 @@ def generate_excel_schedule(schedule_data: Any, blueprint: LayoutBlueprint = Lay
             "remediation": "None required."
         }]
 
-    _render_diagnostics_sheet(wb, diagnostics)
+    _render_diagnostics_sheet(wb, diagnostics, is_rtl)
 
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
     return output
 
-def get_time_block_sort_rank(time_block_name: str) -> int:
-    if not time_block_name:
-        return 99
-    name = str(time_block_name).strip().lower()
 
-    if any(k in name for k in ["morning", "boker", "early", "morning_slot", "shift_1"]):
-        return 1
-    if any(k in name for k in ["afternoon", "tzohorayim", "midday", "noon", "day", "shift_2"]):
-        return 2
-    if any(k in name for k in ["night", "evening", "laila", "late", "pm", "shift_3"]):
-        return 3
+# --- RENDER MATRIX LAYOUT ---
 
-    match = re.search(r"^(\d{1,2})", name)
-    if match:
-        start_hour = int(match.group(1))
-        if 5 <= start_hour < 12:
-            return 1
-        elif 12 <= start_hour < 18:
-            return 2
-        else:
-            return 3
-
-    return 50
-
-def map_hours_to_block(slot: str) -> str:
-    """Helper to map shift hours to standard time blocks if block is unassigned."""
-    s = str(slot).strip()
-    if s in ["06-10", "10:00-14:00", "06-14", "08-16"]:
-        return "morning"
-    elif s in ["14-18", "18:00-22:00", "14-22", "16-24"]:
-        return "afternoon"
-    elif s in ["22-02", "02-06", "22-06", "00-08"]:
-        return "night"
-    return "main"
-
-def get_block_rank(block_name: str) -> int:
-    b = str(block_name).lower()
-    if "morning" in b:
-        return 1
-    if "afternoon" in b:
-        return 2
-    if "night" in b:
-        return 3
-    return 4
-
-def standardize_shift_hours(block: str, job_name: str, slot_idx: int, raw_slot: str) -> str:
-    """Uses the true time slot provided by the input data without hardcoded overrides."""
-    if raw_slot and str(raw_slot).strip().lower() not in ("main", "standard", "none", "", "nan"):
-        clean_str = str(raw_slot).strip().replace("–", "-")
-        return clean_str
-    
-    b = str(block).strip().lower()
-    if "morning" in b:
-        return "06:00-14:00"
-    elif "afternoon" in b:
-        return "14:00-22:00"
-    elif "night" in b:
-        return "22:00-06:00"
-    return "06:00-14:00"
-
-def _render_matrix_layout(ws, assignments, blueprint):
+def _render_matrix_layout(ws, assignments: List[CanonicalAssignment], blueprint: LayoutBlueprint, is_rtl: bool):
     font_header = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
     font_body = Font(name="Calibri", size=10)
     fill_header = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
@@ -201,47 +196,35 @@ def _render_matrix_layout(ws, assignments, blueprint):
     thin_side = Side(border_style="thin", color="D9D9D9")
     border_cell = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
 
+    h_align = "right" if is_rtl else "left"
     align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    align_left = Alignment(horizontal="left", vertical="center")
+    align_side = Alignment(horizontal=h_align, vertical="center")
 
     x_headers = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 
+    # Dynamic Block Discovery (preserves payload order without hardcoded block assumptions)
+    block_order = []
     row_tree = {}
+
     for a in assignments:
-        raw_block = str(getattr(a, "time_block", getattr(a, "block_label", "")) or "").strip().lower()
-        slot = str(getattr(a, "time_slot", getattr(a, "shift_hours", "")) or "").strip()
-        job_name = str(getattr(a, "job_name", getattr(a, "job_category", "General Shift"))).strip()
-        shift_id = str(getattr(a, "shift_id", ""))
+        block_label = str(a.time_block).strip() if a.time_block else "General"
+        if block_label not in block_order:
+            block_order.append(block_label)
 
-        if "morning" in raw_block or "boker" in raw_block or "06" in raw_block or "10" in raw_block:
-            block = "Morning"
-        elif "afternoon" in raw_block or "tzohorayim" in raw_block or "day" in raw_block or "14" in raw_block:
-            block = "Afternoon"
-        elif "night" in raw_block or "laila" in raw_block or "evening" in raw_block or "22" in raw_block:
-            block = "Night"
-        else:
-            block = map_hours_to_block(slot).capitalize()
-            if block not in ["Morning", "Afternoon", "Night"]:
-                block = "Morning"
+        display_slot = standardize_shift_hours(a.time_slot)
+        job_name = str(a.job_name).strip()
+        shift_id = str(a.shift_id)
 
-        # Extract true slot/worker index natively from the shift definition (e.g., required_number_workers instances)
         slot_idx = 1
         parts = shift_id.split("_")
         if parts and parts[-1].isdigit():
             slot_idx = int(parts[-1])
-        elif hasattr(a, "slot_label") and "_slot_" in str(a.slot_label):
-            try:
-                slot_idx = int(a.slot_label.split("_")[-1])
-            except ValueError:
-                pass
 
-        display_slot = standardize_shift_hours(block, job_name, slot_idx, slot)
-        day_key = getattr(a, "day", "").capitalize()
+        day_key = str(a.day).capitalize()
 
-        # Map unique worker instances based on actual slot requirement index rather than arbitrary limits
         current_s_idx = slot_idx
         while True:
-            candidate_key = (block, job_name, display_slot, current_s_idx)
+            candidate_key = (block_label, job_name, display_slot, current_s_idx)
             if candidate_key not in row_tree or day_key not in row_tree[candidate_key]:
                 row_key = candidate_key
                 break
@@ -250,11 +233,12 @@ def _render_matrix_layout(ws, assignments, blueprint):
         if row_key not in row_tree:
             row_tree[row_key] = {}
         
-        row_tree[row_key][day_key] = getattr(a, "worker_name", "")
+        row_tree[row_key][day_key] = a.worker_name
 
+    block_rank_map = {b_label: idx for idx, b_label in enumerate(block_order)}
     sorted_row_keys = sorted(
         row_tree.keys(),
-        key=lambda k: (get_block_rank(k[0]), k[1], k[2], k[3])
+        key=lambda k: (block_rank_map.get(k[0], 99), k[1], k[2], k[3])
     )
 
     headers = ["Time Block", "Job Category", "Shift Hours"] + x_headers
@@ -271,7 +255,7 @@ def _render_matrix_layout(ws, assignments, blueprint):
         for c in (c1, c2, c3):
             c.font, c.fill, c.border = font_body, fill_white, border_cell
         c1.alignment, c3.alignment = align_center, align_center
-        c2.alignment = align_left
+        c2.alignment = align_side
 
         for c_idx, day in enumerate(x_headers, start=4):
             val = row_tree[(t_block, j_name, t_slot, s_idx)].get(day, "")
@@ -292,17 +276,25 @@ def _render_matrix_layout(ws, assignments, blueprint):
                 merge_start = r
 
     for col in ws.columns:
-        max_len = max(len(str(cell.value or '')) for cell in col)
+        max_len = max((len(str(cell.value or '')) for cell in col), default=0)
         col_letter = get_column_letter(col[0].column)
         ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
 
-def _render_analytics_sheet(wb, metrics: dict):
-    ws = wb.create_sheet(title="Analytics")
-    ws.views.sheetView[0].showGridLines = True
+
+# --- RENDER ANALYTICS SHEET ---
+
+def _render_analytics_sheet(wb, metrics: dict, is_rtl: bool):
+    ws = wb.create_sheet(title="אנליטיקה" if is_rtl else "Analytics")
+    ws.views.sheetView[0].rightToLeft = is_rtl
+
+    try:
+        ws.sheet_view.showGridLines = True
+    except AttributeError:
+        pass
 
     font_header = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
     font_section = Font(name="Calibri", size=12, bold=True, color="1F4E78")
-    font_bold =Font(name="Calibri", size=10, bold=True)
+    font_bold = Font(name="Calibri", size=10, bold=True)
     font_body = Font(name="Calibri", size=10)
 
     fill_header = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
@@ -311,14 +303,25 @@ def _render_analytics_sheet(wb, metrics: dict):
     thin_side = Side(border_style="thin", color="D9D9D9")
     border_cell = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
 
+    h_align = "right" if is_rtl else "left"
     align_center = Alignment(horizontal="center", vertical="center")
-    align_left = Alignment(horizontal="left", vertical="center")
+    align_side = Alignment(horizontal=h_align, vertical="center")
 
     current_row = 1
 
     summary_cards = metrics.get("summary_cards", [])
+    manpower = metrics.get("manpower_utilization", [])
+
+    # Calculate Avg Hours per person if missing from summary_cards
+    if manpower and not any("avg hours" in str(card.get("label", "")).lower() or "ממוצע שעות" in str(card.get("label", "")) for card in summary_cards):
+        total_hours = sum(w.get("assigned_hours", 0) for w in manpower)
+        avg_hours = round(total_hours / len(manpower), 2) if manpower else 0.0
+        
+        card_label = "ממוצע שעות לעובד" if is_rtl else "Avg Hours / Person"
+        summary_cards.append({"label": card_label, "value": f"{avg_hours} hrs"})
+
     if summary_cards:
-        ws.cell(row=current_row, column=1, value="Overall Manpower Pool Metrics").font = font_section
+        ws.cell(row=current_row, column=1, value="מדדי כוח אדם כלליים" if is_rtl else "Overall Manpower Pool Metrics").font = font_section
         current_row += 1
         for card in summary_cards:
             c1 = ws.cell(row=current_row, column=1, value=card.get("label", ""))
@@ -326,7 +329,7 @@ def _render_analytics_sheet(wb, metrics: dict):
             c1.font, c2.font = font_body, font_bold
             c1.fill, c2.fill = fill_card, fill_card
             c1.border, c2.border = border_cell, border_cell
-            c2.alignment = align_center
+            c1.alignment, c2.alignment = align_side, align_center
             current_row += 1
         current_row += 2
 
@@ -350,11 +353,10 @@ def _render_analytics_sheet(wb, metrics: dict):
             for col_idx, val in enumerate(vals, start=1):
                 c = ws.cell(row=current_row, column=col_idx, value=val)
                 c.font, c.border = font_body, border_cell
-                c.alignment = align_left if col_idx == 1 else align_center
+                c.alignment = align_side if col_idx == 1 else align_center
             current_row += 1
         current_row += 2
 
-    manpower = metrics.get("manpower_utilization", [])
     if manpower:
         ws.cell(row=current_row, column=1, value="Individual Worker Capacity & Despair").font = font_section
         current_row += 1
@@ -375,17 +377,25 @@ def _render_analytics_sheet(wb, metrics: dict):
             for col_idx, val in enumerate(vals, start=1):
                 c = ws.cell(row=current_row, column=col_idx, value=val)
                 c.font, c.border = font_body, border_cell
-                c.alignment = align_left if col_idx in (1, 2) else align_center
+                c.alignment = align_side if col_idx in (1, 2) else align_center
             current_row += 1
 
     for col in ws.columns:
-        max_len = max(len(str(cell.value or '')) for cell in col)
+        max_len = max((len(str(cell.value or '')) for cell in col), default=0)
         col_letter = get_column_letter(col[0].column)
         ws.column_dimensions[col_letter].width = max(max_len + 3, 18)
 
-def _render_diagnostics_sheet(wb, diagnostics: list):
-    ws = wb.create_sheet(title="System_Diagnostics")
-    ws.views.sheetView[0].showGridLines = True
+
+# --- RENDER DIAGNOSTICS SHEET ---
+
+def _render_diagnostics_sheet(wb, diagnostics: list, is_rtl: bool):
+    ws = wb.create_sheet(title="דיאגנוסטיקה" if is_rtl else "System_Diagnostics")
+    ws.views.sheetView[0].rightToLeft = is_rtl
+
+    try:
+        ws.sheet_view.showGridLines = True
+    except AttributeError:
+        pass
 
     font_header = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
     font_body = Font(name="Calibri", size=10)
@@ -393,8 +403,10 @@ def _render_diagnostics_sheet(wb, diagnostics: list):
     
     thin_side = Side(border_style="thin", color="D9D9D9")
     border_cell = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+    
+    h_align = "right" if is_rtl else "left"
     align_center = Alignment(horizontal="center", vertical="center")
-    align_left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    align_side = Alignment(horizontal=h_align, vertical="center", wrap_text=True)
 
     headers = ["Severity", "Code", "Affected Entity / Role", "Diagnostic Reason", "Actionable Remediation"]
     for col_idx, h_text in enumerate(headers, start=1):
@@ -412,7 +424,7 @@ def _render_diagnostics_sheet(wb, diagnostics: list):
             cell.font, cell.border = font_body, border_cell
 
         c1.alignment, c2.alignment = align_center, align_center
-        c3.alignment, c4.alignment, c5.alignment = align_left, align_left, align_left
+        c3.alignment, c4.alignment, c5.alignment = align_side, align_side, align_side
 
     ws.column_dimensions['A'].width = 14
     ws.column_dimensions['B'].width = 20
@@ -420,7 +432,10 @@ def _render_diagnostics_sheet(wb, diagnostics: list):
     ws.column_dimensions['D'].width = 45
     ws.column_dimensions['E'].width = 45
 
-def _render_tabular_layout(ws, assignments: List[CanonicalAssignment], blueprint: LayoutBlueprint):
+
+# --- RENDER TABULAR LAYOUT ---
+
+def _render_tabular_layout(ws, assignments: List[CanonicalAssignment], blueprint: LayoutBlueprint, is_rtl: bool):
     headers = ["Shift ID", "Day", "Block Label", "Time Slot", "Job", "Worker UID", "Worker Name"]
     ws.append(headers)
     for a in assignments:

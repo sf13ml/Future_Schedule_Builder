@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional, List, Tuple, Dict, Any
 from datetime import datetime
 
@@ -7,6 +7,7 @@ from sqlalchemy import Column, String, Float, Boolean, Integer, ForeignKey, JSON
 from sqlalchemy.orm import relationship
 from database import Base
 
+
 class WorkerModel(Base):
     __tablename__ = "workers"
 
@@ -14,10 +15,13 @@ class WorkerModel(Base):
     name = Column(String, nullable=False)
     talents = Column(JSON, default=list)
     despair = Column(Float, default=0.0)
-    total_hours = Column(Float, default=0.0)
+
+    # State & Workload Tracking
+    historical_hours = Column(Float, default=0.0)
+    planned_hours = Column(Float, default=0.0)
     last_job = Column(String, nullable=True)
     last_shift_slot = Column(String, nullable=True)
-    last_shift_end_time = Column(Float, default=-8.0)
+    last_assigned_end_hour = Column(Float, default=-8.0)
     prefers_night = Column(Boolean, default=False)
     is_voluntary_grinder = Column(Boolean, default=False)
 
@@ -29,10 +33,12 @@ class WorkerModel(Base):
             "name": self.name,
             "talents": self.talents,
             "despair": self.despair,
-            "total_hours": self.total_hours,
+            "historical_hours": self.historical_hours,
+            "planned_hours": self.planned_hours,
+            "total_hours": self.historical_hours + self.planned_hours,
             "last_job": self.last_job,
             "last_shift_slot": self.last_shift_slot,
-            "last_shift_end_time": self.last_shift_end_time,
+            "last_assigned_end_hour": self.last_assigned_end_hour,
             "prefers_night": self.prefers_night,
             "is_voluntary_grinder": self.is_voluntary_grinder,
             "previous_weeks_load_scores": [h.hours_worked for h in self.history]
@@ -85,6 +91,8 @@ class Shift(BaseModel):
     time_block: str = "main"  # Carries block context (e.g., 'morning', 'afternoon', 'night')
     hours_duration: float
     abs_start_hour: float
+    is_fixed: bool = False
+    assigned_worker_uids: List[str] = Field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -99,19 +107,27 @@ class Worker(BaseModel):
     name: str
     talents: List[str] = Field(default_factory=list)
     despair: float = 0.0
-    total_hours: float = 0.0
+
+    # State & Workload Tracking
+    historical_hours: float = 0.0
+    planned_hours: float = 0.0
     last_job: Optional[str] = None
     last_shift_slot: Optional[str] = None
-    last_shift_end_time: Optional[float] = None
+    last_assigned_end_hour: float = -8.0
     prefers_night: bool = False
-    
+    is_voluntary_grinder: bool = False
+
     consecutive_days_worked: int = 0
     fatigue_multiplier_bonus: float = 1.0
-    
+
     unavailable_days: List[str] = Field(default_factory=list)
     blocked_intervals: List[Tuple[float, float]] = Field(default_factory=list)
-    
     previous_weeks_load_scores: List[float] = Field(default_factory=list)
+
+    @property
+    def total_hours(self) -> float:
+        """Dynamically sums past fixed shifts and new solver-planned shifts."""
+        return self.historical_hours + self.planned_hours
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -126,18 +142,21 @@ class Worker(BaseModel):
         worker_talents = {str(t).strip().lower() for t in self.talents}
         req_talents = {str(t).strip().lower() for t in job.required_talents}
         forbidden_talents = {str(t).strip().lower() for t in job.forbidden_talents}
-        
+
         has_positives = req_talents.issubset(worker_talents)
         has_no_negatives = not worker_talents.intersection(forbidden_talents)
         return has_positives and has_no_negatives
 
     def to_dict(self):
-        return self.model_dump()
+        d = self.model_dump()
+        d["total_hours"] = self.total_hours
+        return d
+
 
 class PolicyConfig(BaseModel):
     # TODO: Connect this default to employer/tenant settings database model if custom per-client policies are loaded dynamically
-    min_rest_hours_default: float = 8.0          # Base default: 8 hours minimum rest between shifts
-    enforce_strict_rest: bool = True             # Enabled by default
+    min_rest_hours_default: float = 8.0
+    enforce_strict_rest: bool = True
     max_weekly_hours_per_worker: float = 168.0
     enforce_max_hours_cap: bool = False
     enforce_consecutive_day_limit: bool = False
@@ -168,6 +187,7 @@ class AssingmentOutput(BaseModel):
     hours_duration: float
     worker_uid: str
     worker_name: str
+
 
 AssignmentOutput = AssingmentOutput
 
@@ -266,4 +286,74 @@ class LayoutBlueprint(BaseModel):
         return cls.model_validate(data)
 
     def to_dict(self):
+        return self.model_dump()
+
+
+# --- TOP-LEVEL PAYLOAD SCHEMAS FOR INGESTION & EXPORT ---
+
+class ShiftBlockMeta(BaseModel):
+    block_id: str
+    name: str
+    shift_hours: Optional[str] = ""
+
+
+class SchedulePayload(BaseModel):
+    assignments: List[Dict[str, Any]] = Field(default_factory=list)
+    shift_blocks: List[Dict[str, Any]] = Field(default_factory=list)
+    metrics: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    diagnostics: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
+    status: Optional[str] = "optimal"
+
+    @model_validator(mode="before")
+    @classmethod
+    def auto_discover_shift_blocks(cls, data: Any) -> Any:
+        """
+        Pre-validator that intercepts raw input payload data before validation.
+        Scans all assignments for time_block labels (e.g. 'morning') and 
+        dynamically registers them into shift_blocks if missing.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        raw_assignments = data.get("assignments") or data.get("schedule") or []
+        raw_blocks = data.get("shift_blocks") or data.get("blocks") or []
+
+        # 1. Collect all unique time_block labels from incoming assignments
+        discovered_blocks = set()
+        for assignment in raw_assignments:
+            if isinstance(assignment, dict):
+                block = (
+                    assignment.get("time_block") 
+                    or assignment.get("block_label") 
+                    or assignment.get("block")
+                )
+                if block and str(block).strip():
+                    discovered_blocks.add(str(block).strip().lower())
+
+        # 2. Extract existing block IDs/names from payload metadata
+        existing_block_keys = set()
+        for b in raw_blocks:
+            if isinstance(b, dict):
+                b_key = b.get("block_id") or b.get("id") or b.get("name") or ""
+                if b_key:
+                    existing_block_keys.add(str(b_key).strip().lower())
+
+        # 3. Inject any missing block label (e.g. 'morning') automatically
+        updated_blocks = list(raw_blocks)
+        for block_name in discovered_blocks:
+            if block_name not in existing_block_keys:
+                updated_blocks.append({
+                    "block_id": block_name,
+                    "name": block_name.capitalize(),
+                    "shift_hours": ""
+                })
+
+        data["shift_blocks"] = updated_blocks
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SchedulePayload":
+        return cls.model_validate(data)
+
+    def to_dict(self) -> Dict[str, Any]:
         return self.model_dump()

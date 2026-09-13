@@ -239,12 +239,19 @@ def ingest_from_excel(file_path_or_buffer) -> Tuple[List[Dict[str, Any]], List[D
         df_emp = pd.read_excel(xls, "Employees")
         for row in df_emp.to_dict("records"):
             raw_quals = str(row.get("qualifications", "")) if pd.notna(row.get("qualifications")) else ""
+            raw_off_days = row.get("unavailable_days", "")
+            if pd.isna(raw_off_days):
+                raw_off_days = ""
+            parsed_off_days = [d.strip().capitalize() for d in str(raw_off_days).split(",") if d.strip()]
+            # Only keep values that are actually recognized weekday names - silently drops
+            # typos/garbage instead of creating a day-off value that can never match a shift.
+            valid_off_days = [d for d in parsed_off_days if d in DAY_OFFSETS]
             workers.append({
                 "uid": str(row.get("uid", "")).strip(),
                 "name": str(row.get("name", "")).strip(),
                 "talents": [t.strip().lower() for t in raw_quals.split(",") if t.strip()],
                 "prefers_night": str(row.get("prefers_night", "N")).strip().upper() in ["Y", "YES", "1", "TRUE"],
-                "unavailable_days": [d.strip().capitalize() for d in str(row.get("unavailable_days", "")).split(",") if d.strip()]
+                "unavailable_days": valid_off_days
             })
 
     return workers, unrolled_shifts

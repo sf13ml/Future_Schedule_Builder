@@ -1,12 +1,16 @@
 from ortools.sat.python import cp_model
 from models import Worker, Shift, PolicyConfig
 from datetime import datetime
+from collections import defaultdict
 import statistics
 from typing import Optional, Dict, List, Tuple, Any
 
+# Calendar order used to detect "consecutive calendar day" same-shift repeats.
+DAY_ORDER = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
 def generate_schedule(workers: List[Worker], shifts: List[Shift], policy: PolicyConfig = PolicyConfig()) -> dict:
     model = cp_model.CpModel()
-    objective_terms = []
+    objective_terms = [] 
 
     # 1. ASSIGNMENT VARIABLES
     assign_vars = {}
@@ -88,6 +92,45 @@ def generate_schedule(workers: List[Worker], shifts: List[Shift], policy: Policy
                 sum(assign_vars[(w.uid, s.id)] * int(s.hours_duration) for s in shifts) <= max_cap
             )
 
+    # 3.7 ONE JOB TYPE PER WORKER PER DAY
+    # Stops a worker from being pulled into two different job categories on the same
+    # calendar day (e.g. an 8h patrol block in the morning + a 4h guard slot at night).
+    # Multiple shifts of the SAME job type on the same day are still fine (e.g. two
+    # separate 4h guard slots) - only mixing job categories within a day is discouraged/blocked.
+    shifts_by_day: Dict[str, List[Shift]] = defaultdict(list)
+    for s in shifts:
+        shifts_by_day[s.day].append(s)
+
+    enforce_single_job_hard = getattr(policy, 'enforce_single_job_type_per_day', False)
+    single_job_penalty_weight = getattr(policy, 'single_job_day_penalty_weight', 0.0)
+
+    if enforce_single_job_hard or single_job_penalty_weight > 0:
+        for w in workers:
+            for day, day_shifts in shifts_by_day.items():
+                jobs_today: Dict[str, List[Shift]] = defaultdict(list)
+                for s in day_shifts:
+                    if (w.uid, s.id) in assign_vars:
+                        job_name = getattr(s.job, 'name', str(s.job))
+                        jobs_today[job_name].append(s)
+
+                if len(jobs_today) <= 1:
+                    continue  # only one job type even possible today - nothing to constrain
+
+                used_job_vars = []
+                for job_name, job_shifts in jobs_today.items():
+                    used_var = model.NewBoolVar(f"used_{w.uid}_{day}_{job_name}")
+                    shift_vars = [assign_vars[(w.uid, s.id)] for s in job_shifts]
+                    # used_var forced to 1 if the worker takes ANY shift of this job type today
+                    model.Add(sum(shift_vars) <= len(shift_vars) * used_var)
+                    used_job_vars.append(used_var)
+
+                if enforce_single_job_hard:
+                    model.Add(sum(used_job_vars) <= 1)
+                else:
+                    extra_job_types = model.NewIntVar(0, len(used_job_vars), f"extra_jobs_{w.uid}_{day}")
+                    model.Add(extra_job_types >= sum(used_job_vars) - 1)
+                    objective_terms.append(extra_job_types * int(round(single_job_penalty_weight)))
+
     # 5. WORKLOAD & PREFERENCE OBJECTIVE TERMS
     for w in workers:
         worker_assigned_hours = model.NewIntVar(0, 168, f"total_hours_{w.uid}")
@@ -103,8 +146,11 @@ def generate_schedule(workers: List[Worker], shifts: List[Shift], policy: Policy
         t4 = model.NewIntVar(0, 112, f"t4_{w.uid}")
 
         model.Add(worker_assigned_hours == t1 + t2 + t3 + t4)
+        # Hours-fairness signal. Weighted up so uneven total-hours distribution
+        # costs more than the night-shift / same-shift-repeat preference terms below.
+        hours_weight = getattr(policy, 'hours_balance_weight', 1.0)
         tier_cost = (t1 * 10) + (t2 * 18) + (t3 * 35) + (t4 * 70)
-        objective_terms.append(tier_cost)
+        objective_terms.append(int(round(hours_weight)) * tier_cost)
 
         for s in shifts:
             hour_of_day = s.abs_start_hour % 24
@@ -120,6 +166,46 @@ def generate_schedule(workers: List[Worker], shifts: List[Shift], policy: Policy
 
             shift_base_cost = int(round(s.hours_duration * time_multiplier * job_despair_factor * historical_factor * 100))
             objective_terms.append(assign_vars[(w.uid, s.id)] * shift_base_cost)
+
+    # 5.5 SAME-SHIFT REPEAT PENALTY (day-to-day)
+    # Adds an extra cost when the SAME worker is assigned the SAME job + time slot on
+    # two consecutive calendar days (e.g. Register 06:00-14:00 on both Mon and Tue).
+    # Implemented as a bonus on top of the shift's normal cost, so it stacks with (rather
+    # than replaces) the night-shift/despair/historical pricing above.
+    repeat_multiplier = getattr(policy, 'same_shift_repeat_penalty_multiplier', 1.0)
+    if repeat_multiplier and repeat_multiplier != 1.0:
+        same_slot_groups: Dict[Tuple[str, str], List[Shift]] = defaultdict(list)
+        for s in shifts:
+            job_name = getattr(s.job, 'name', str(s.job))
+            same_slot_groups[(job_name, s.time_slot)].append(s)
+
+        for (job_name, time_slot), group in same_slot_groups.items():
+            valid_group = [s for s in group if s.day in DAY_ORDER]
+            group_sorted = sorted(valid_group, key=lambda sh: DAY_ORDER.index(sh.day))
+
+            for i in range(len(group_sorted) - 1):
+                s_prev, s_curr = group_sorted[i], group_sorted[i + 1]
+                if DAY_ORDER.index(s_curr.day) != DAY_ORDER.index(s_prev.day) + 1:
+                    continue  # only truly consecutive calendar days, not just next-in-list
+
+                for w in workers:
+                    key_prev = (w.uid, s_prev.id)
+                    key_curr = (w.uid, s_curr.id)
+                    if key_prev not in assign_vars or key_curr not in assign_vars:
+                        continue
+                    # Skip workers who are already hard-forced to 0 for this job (wrong
+                    # talents, etc.) - no point building a repeat-penalty gate for them.
+                    if not w.is_eligible_for_job(s_prev.job) or not w.is_eligible_for_job(s_curr.job):
+                        continue
+
+                    both_days_var = model.NewBoolVar(f"repeat_{w.uid}_{s_prev.id}_{s_curr.id}")
+                    model.AddMultiplicationEquality(
+                        both_days_var, [assign_vars[key_prev], assign_vars[key_curr]]
+                    )
+
+                    extra_cost = int(round(s_curr.hours_duration * (repeat_multiplier - 1.0) * 100))
+                    if extra_cost > 0:
+                        objective_terms.append(both_days_var * extra_cost)
 
     model.Minimize(sum(objective_terms))
 
@@ -156,6 +242,29 @@ def generate_schedule(workers: List[Worker], shifts: List[Shift], policy: Policy
                     "remediation": "Adjust worker availability or recruit extra staff."
                 })
 
+        # Pre-compute which (worker, shift) pairs actually landed on a same-job/same-slot
+        # consecutive-day repeat, so the reported despair matches what the solver priced in.
+        repeat_hits = set()
+        repeat_multiplier_report = getattr(policy, 'same_shift_repeat_penalty_multiplier', 1.0)
+        if repeat_multiplier_report and repeat_multiplier_report != 1.0:
+            same_slot_groups_report: Dict[Tuple[str, str], List[Shift]] = defaultdict(list)
+            for s in shifts:
+                job_name_key = getattr(s.job, 'name', str(s.job))
+                same_slot_groups_report[(job_name_key, s.time_slot)].append(s)
+
+            for (job_name_key, time_slot_key), group in same_slot_groups_report.items():
+                valid_group = [s for s in group if s.day in DAY_ORDER]
+                group_sorted = sorted(valid_group, key=lambda sh: DAY_ORDER.index(sh.day))
+                for i in range(len(group_sorted) - 1):
+                    s_prev, s_curr = group_sorted[i], group_sorted[i + 1]
+                    if DAY_ORDER.index(s_curr.day) != DAY_ORDER.index(s_prev.day) + 1:
+                        continue
+                    for w in workers:
+                        if (w.uid, s_prev.id) in assign_vars and (w.uid, s_curr.id) in assign_vars:
+                            if solver.Value(assign_vars[(w.uid, s_prev.id)]) == 1 and \
+                               solver.Value(assign_vars[(w.uid, s_curr.id)]) == 1:
+                                repeat_hits.add((w.uid, s_curr.id))
+
         for s in shifts:
             job_name = s.job.name if hasattr(s.job, "name") else str(s.job)
             req_workers = getattr(s.job, 'required_number_workers', 1)
@@ -176,7 +285,9 @@ def generate_schedule(workers: List[Worker], shifts: List[Shift], policy: Policy
                     multiplier = policy.night_shift_penalty_multiplier if is_night else 1.0
                     if is_night and getattr(w, 'prefers_night', False):
                         multiplier = policy.night_owl_discount
-                    
+                    if (w.uid, s.id) in repeat_hits:
+                        multiplier *= repeat_multiplier_report
+
                     job_despair_factor = getattr(s.job, 'despair_factor', 1.0)
                     despair_added = s.hours_duration * multiplier * job_despair_factor
 

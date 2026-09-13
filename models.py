@@ -168,6 +168,31 @@ class PolicyConfig(BaseModel):
     turnaround_penalty_cost: int = 50
     tight_turnaround_threshold_hours: float = 8.0
 
+    # Controls how strongly total-hours fairness (the overtime tiering below) outweighs
+    # per-shift preference penalties like the night-shift multiplier or the same-shift
+    # repeat penalty. Raise this if the solver is still letting night/repeat penalties
+    # override even hour distribution; lower it if hours are being over-prioritized to
+    # the point of ignoring night/repeat preferences entirely.
+    hours_balance_weight: float = 4.0
+
+    # Multiplier applied when a worker is assigned the same job + time slot on two
+    # consecutive calendar days (e.g. "Register 06:00-14:00" Monday and Tuesday).
+    # 1.4 = 40% extra cost added on top of the normal shift cost for the repeated day.
+    same_shift_repeat_penalty_multiplier: float = 1.4
+
+    # If True, a worker can NEVER work two different job categories on the same calendar
+    # day (e.g. patrol in the morning + guard duty at night) - hard block. Recommended:
+    # in testing this was both safe (never caused infeasibility with realistic staffing)
+    # and noticeably faster to solve than the soft penalty below, since it gives the
+    # solver a much smaller space to search instead of pricing every mixed-day tradeoff.
+    enforce_single_job_type_per_day: bool = True
+
+    # Soft alternative to the hard rule above: cost added per EXTRA distinct job category
+    # a worker works in a single day (first job type is always free). Only used when
+    # enforce_single_job_type_per_day is False. Available if a hard block ever proves too
+    # restrictive for a specific roster, but expect slower solves - see comment above.
+    single_job_day_penalty_weight: float = 5000.0
+
     @classmethod
     def from_dict(cls, data: Optional[dict]):
         if not data:
@@ -309,7 +334,7 @@ class SchedulePayload(BaseModel):
     def auto_discover_shift_blocks(cls, data: Any) -> Any:
         """
         Pre-validator that intercepts raw input payload data before validation.
-        Scans all assignments for time_block labels (e.g. 'morning') and 
+        Scans all assignments for time_block labels (e.g. 'morning') and
         dynamically registers them into shift_blocks if missing.
         """
         if not isinstance(data, dict):
@@ -323,8 +348,8 @@ class SchedulePayload(BaseModel):
         for assignment in raw_assignments:
             if isinstance(assignment, dict):
                 block = (
-                    assignment.get("time_block") 
-                    or assignment.get("block_label") 
+                    assignment.get("time_block")
+                    or assignment.get("block_label")
                     or assignment.get("block")
                 )
                 if block and str(block).strip():

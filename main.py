@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv() 
+from fastapi import FastAPI
 import io
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, status, Response
@@ -10,6 +13,7 @@ import crud
 from ingest import ingest_from_excel
 from solver import generate_schedule
 from excel_exporter import generate_excel_schedule
+
 
 app = FastAPI(
     title="Shift Scheduler & Workforce Engine", 
